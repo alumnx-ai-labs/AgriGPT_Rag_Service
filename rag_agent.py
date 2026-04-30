@@ -22,10 +22,11 @@ load_dotenv()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
-OLLAMA_API_KEY   = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+PINECONE_API_KEY  = os.getenv("PINECONE_API_KEY")
+OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY", "")
+OLLAMA_MODEL      = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY not set")
@@ -73,7 +74,7 @@ def _ollama_embed(texts) -> List[List[float]]:
         # Try newer batch endpoint first
         r = http.post(
             f"{OLLAMA_HOST}/api/embed",
-            json={"model": OLLAMA_MODEL, "input": texts},
+            json={"model": OLLAMA_EMBED_MODEL, "input": texts},
             headers=_HEADERS,
         )
         if r.status_code == 200:
@@ -85,7 +86,7 @@ def _ollama_embed(texts) -> List[List[float]]:
         for t in texts:
             r2 = http.post(
                 f"{OLLAMA_HOST}/api/embeddings",
-                json={"model": OLLAMA_MODEL, "prompt": t},
+                json={"model": OLLAMA_EMBED_MODEL, "prompt": t},
                 headers=_HEADERS,
             )
             if r2.status_code == 200:
@@ -99,10 +100,10 @@ def _ollama_embed(texts) -> List[List[float]]:
 def _detect_dim() -> int:
     try:
         vec = _ollama_embed("test")[0]
-        print(f"[EMBED] dim={len(vec)}")
+        print(f"[EMBED] model={OLLAMA_EMBED_MODEL} dim={len(vec)}")
         return len(vec)
     except Exception as e:
-        fallback = int(os.getenv("EMBED_DIM", "2048"))
+        fallback = int(os.getenv("EMBED_DIM", "768"))
         print(f"[EMBED] detection failed: {e} — using {fallback}")
         return fallback
 
