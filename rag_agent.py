@@ -193,58 +193,37 @@ def _embed_query(text: str) -> List[float]:
 
 # ── Chat helper ────────────────────────────────────────────────────────────────
 
-def _parse_sse(text: str) -> Dict:
-    content_parts  = []
-    tool_calls_map: Dict[int, Dict] = {}
-    for line in text.splitlines():
-        if not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if data == "[DONE]":
-            break
-        try:
-            chunk = json.loads(data)
-            delta = chunk.get("choices", [{}])[0].get("delta", {})
-            if delta.get("content"):
-                content_parts.append(delta["content"])
-            for tc in delta.get("tool_calls", []):
-                idx = tc.get("index", 0)
-                if idx not in tool_calls_map:
-                    tool_calls_map[idx] = {
-                        "id": tc.get("id", f"call_{idx}"),
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    }
-                if tc.get("id"):
-                    tool_calls_map[idx]["id"] = tc["id"]
-                fn = tc.get("function", {})
-                tool_calls_map[idx]["function"]["name"]      += fn.get("name", "")
-                tool_calls_map[idx]["function"]["arguments"] += fn.get("arguments", "")
-        except json.JSONDecodeError:
-            pass
-    msg: Dict = {"role": "assistant", "content": "".join(content_parts)}
-    if tool_calls_map:
-        msg["tool_calls"] = [tool_calls_map[i] for i in sorted(tool_calls_map)]
-    return {"choices": [{"message": msg}]}
-
-
 def _chat(messages: List[Dict], tools: Optional[List[Dict]] = None) -> Dict:
     payload: Dict = {"model": OLLAMA_MODEL, "messages": messages, "stream": False}
     if tools:
         payload["tools"] = tools
     with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
         r = http.post(
-            f"{OLLAMA_BASE_URL}/chat/completions",
+            f"{OLLAMA_HOST}/api/chat",
             json=payload,
             headers=_HEADERS,
         )
         if r.status_code != 200:
             print(f"[CHAT] {r.status_code}: {r.text[:300]}")
             r.raise_for_status()
-        text = r.text.strip()
-        if text.startswith("data:"):
-            return _parse_sse(text)
-        return json.loads(text)
+        # Ollama may return NDJSON even with stream=False — take the last line
+        lines = [l for l in r.text.strip().splitlines() if l.strip()]
+        data  = json.loads(lines[-1])
+        msg   = data.get("message", {})
+        normalized: Dict = {"role": "assistant", "content": msg.get("content") or ""}
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            for i, tc in enumerate(tool_calls):
+                if "id" not in tc:
+                    tc["id"] = f"call_{i}"
+                if "type" not in tc:
+                    tc["type"] = "function"
+                # Native Ollama returns arguments as a dict; serialize for consistency
+                fn_args = tc.get("function", {}).get("arguments")
+                if isinstance(fn_args, dict):
+                    tc["function"]["arguments"] = json.dumps(fn_args)
+            normalized["tool_calls"] = tool_calls
+        return {"choices": [{"message": normalized}]}
 
 # ── Pinecone search ────────────────────────────────────────────────────────────
 
