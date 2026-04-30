@@ -141,31 +141,39 @@ def _embed_query(text: str) -> List[float]:
 
 def _parse_ndjson(text: str) -> Dict:
     """
-    Ollama sometimes streams NDJSON even when stream=False.
-    Accumulate content chunks and return the final assembled response.
+    Ollama streams NDJSON even when stream=False.
+    tool_calls appear in early lines; content is spread across all lines.
     """
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
     if len(lines) == 1:
         return json.loads(lines[0])
 
     content_parts = []
-    final = {}
+    tool_calls    = []
+    final         = {}
     for line in lines:
         try:
             obj = json.loads(line)
-            chunk = obj.get("message", {}).get("content", "")
-            if chunk:
-                content_parts.append(chunk)
+            msg = obj.get("message", {})
+            if msg.get("content"):
+                content_parts.append(msg["content"])
+            if msg.get("tool_calls"):
+                tool_calls = msg["tool_calls"]
             if obj.get("done"):
                 final = obj
         except json.JSONDecodeError:
             pass
 
-    if final:
-        final.setdefault("message", {})["content"] = "".join(content_parts)
-        return final
+    if not final and lines:
+        final = json.loads(lines[-1])
 
-    return json.loads(lines[-1])
+    final.setdefault("message", {})
+    final["message"]["content"] = "".join(content_parts)
+    if tool_calls:
+        final["message"]["tool_calls"] = tool_calls
+
+    print(f"[CHAT] content={final['message']['content'][:80]!r}  tool_calls={bool(tool_calls)}")
+    return final
 
 
 def _chat(messages: List[Dict], tools: List[Dict] = None) -> Dict:
@@ -345,6 +353,28 @@ async def query(request: QueryRequest):
 
         resp = _chat(messages)
         msg  = resp.get("message", {})
+
+    else:
+        # Fallback: model didn't call tools — search both indexes directly
+        print("No tool calls — falling back to direct search")
+        for doc_type in ("pests", "schemes"):
+            chunks = _search(doc_type, request.question, request.top_k)
+            if chunks:
+                all_sources.extend(chunks)
+                tools_used.append(f"search_{doc_type}")
+
+        if all_sources:
+            context = "\n\n".join(f"[{c['filename']}]: {c['text']}" for c in all_sources)
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Use the following context to answer the question.\n\n"
+                    f"Context:\n{context}\n\n"
+                    f"Question: {request.question}"
+                ),
+            })
+            resp = _chat(messages)
+            msg  = resp.get("message", {})
 
     answer = msg.get("content") or "No answer could be generated."
 
