@@ -40,7 +40,11 @@ UPSERT_BATCH  = 100
 # ── Clients ────────────────────────────────────────────────────────────────────
 
 pc     = Pinecone(api_key=PINECONE_API_KEY)
-client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
+client = OpenAI(
+    base_url=OLLAMA_BASE_URL,
+    api_key=OLLAMA_API_KEY,
+    timeout=300.0,  # 5 min — 26B models need time to generate
+)
 
 app = FastAPI(
     title="AgriGPT RAG Service",
