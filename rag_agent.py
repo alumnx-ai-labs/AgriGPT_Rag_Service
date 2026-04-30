@@ -206,10 +206,21 @@ def _chat(messages: List[Dict], tools: Optional[List[Dict]] = None) -> Dict:
         if r.status_code != 200:
             print(f"[CHAT] {r.status_code}: {r.text[:300]}")
             r.raise_for_status()
-        # Ollama may return NDJSON even with stream=False — take the last line
-        lines = [l for l in r.text.strip().splitlines() if l.strip()]
-        data  = json.loads(lines[-1])
-        msg   = data.get("message", {})
+        # Ollama may stream NDJSON even with stream=False — accumulate all content
+        lines  = [l for l in r.text.strip().splitlines() if l.strip()]
+        parsed = [json.loads(l) for l in lines]
+        if len(parsed) == 1:
+            msg = parsed[0].get("message", {})
+        else:
+            # streaming: each line has a content delta; last line is empty with done=true
+            content = "".join(p.get("message", {}).get("content", "") for p in parsed)
+            tc_list = next(
+                (p["message"]["tool_calls"] for p in parsed
+                 if p.get("message", {}).get("tool_calls")), None
+            )
+            msg = {"role": "assistant", "content": content}
+            if tc_list:
+                msg["tool_calls"] = tc_list
         normalized: Dict = {"role": "assistant", "content": msg.get("content") or ""}
         tool_calls = msg.get("tool_calls")
         if tool_calls:
