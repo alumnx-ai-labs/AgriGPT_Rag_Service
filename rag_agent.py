@@ -346,12 +346,44 @@ async def upload(
         chunks_added=len(chunks),
     )
 
+# ── Question classifier ────────────────────────────────────────────────────────
+
+_SCHEMES_KEYWORDS = {
+    "scheme", "yojana", "kisan", "subsidy", "pension", "insurance", "pmfby",
+    "rkvy", "enam", "msp", "government", "benefit", "eligibility", "application",
+    "pm-kisan", "pmksy", "sinchayee", "fasal", "bima", "maan dhan", "nabard",
+    "loan", "credit", "support price", "procurement", "registration", "portal",
+}
+
+def _classify_question(question: str) -> str:
+    """Return 'schemes', 'pests', or 'both'."""
+    q = question.lower()
+    has_schemes = any(kw in q for kw in _SCHEMES_KEYWORDS)
+    pest_words  = {"pest", "disease", "insect", "fungus", "blight", "worm",
+                   "spray", "pesticide", "fungicide", "treatment", "symptom",
+                   "crop damage", "infestation", "larvae", "virus", "wilt"}
+    has_pests   = any(kw in q for kw in pest_words)
+    if has_schemes and not has_pests:
+        return "schemes"
+    if has_pests and not has_schemes:
+        return "pests"
+    return "both"
+
+_TOOLS_BY_TYPE = {
+    "schemes": [_TOOLS[1]],
+    "pests":   [_TOOLS[0]],
+    "both":    _TOOLS,
+}
+
 # ── Query ──────────────────────────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
 async def query(request: QueryRequest):
+    q_type   = _classify_question(request.question)
+    tools    = _TOOLS_BY_TYPE[q_type]
+    print(f"[QUERY] classified={q_type!r}")
     messages: List[Dict] = [{"role": "user", "content": request.question}]
-    resp = _chat(messages, tools=_TOOLS)
+    resp = _chat(messages, tools=tools)
     msg  = resp["choices"][0]["message"]
 
     all_sources: List[Dict] = []
@@ -386,9 +418,10 @@ async def query(request: QueryRequest):
             msg  = resp["choices"][0]["message"]
 
     else:
-        # Fallback: model skipped tools — search directly
+        # Fallback: model skipped tools — search directly using classification
         print("[QUERY] no tool calls — direct search fallback")
-        for doc_type in ("pests", "schemes"):
+        search_types = ("pests", "schemes") if q_type == "both" else (q_type,)
+        for doc_type in search_types:
             chunks = _search(doc_type, request.question, request.top_k)
             if chunks:
                 all_sources.extend(chunks)
