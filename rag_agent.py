@@ -261,44 +261,28 @@ _TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "search_pests",
+            "name": "search_agriculture",
             "description": (
-                "Search the pests and diseases knowledge base for questions about "
-                "crop diseases, pest identification, symptoms, treatments and prevention."
+                "Search the agriculture knowledge base. "
+                "Set type='pests' for questions about crop pests, diseases, symptoms, or treatments. "
+                "Set type='schemes' for questions about government schemes, subsidies, farmer benefits, or financial aid."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer"},
+                    "query": {"type": "string", "description": "Search query"},
+                    "type":  {"type": "string", "enum": ["pests", "schemes"],
+                              "description": "Knowledge base to search"},
+                    "top_k": {"type": "integer", "description": "Number of results"},
                 },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_schemes",
-            "description": (
-                "Search the government schemes knowledge base for questions about "
-                "agricultural subsidies, programs, farmer benefits and financial aid."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer"},
-                },
-                "required": ["query"],
+                "required": ["query", "type"],
             },
         },
     },
 ]
 
 _TOOL_FN = {
-    "search_pests":   lambda q, k: _search("pests", q, k),
-    "search_schemes": lambda q, k: _search("schemes", q, k),
+    "search_agriculture": lambda q, t, k: _search(t, q, k),
 }
 
 # ── Upload ─────────────────────────────────────────────────────────────────────
@@ -346,44 +330,12 @@ async def upload(
         chunks_added=len(chunks),
     )
 
-# ── Question classifier ────────────────────────────────────────────────────────
-
-_SCHEMES_KEYWORDS = {
-    "scheme", "yojana", "kisan", "subsidy", "pension", "insurance", "pmfby",
-    "rkvy", "enam", "msp", "government", "benefit", "eligibility", "application",
-    "pm-kisan", "pmksy", "sinchayee", "fasal", "bima", "maan dhan", "nabard",
-    "loan", "credit", "support price", "procurement", "registration", "portal",
-}
-
-def _classify_question(question: str) -> str:
-    """Return 'schemes', 'pests', or 'both'."""
-    q = question.lower()
-    has_schemes = any(kw in q for kw in _SCHEMES_KEYWORDS)
-    pest_words  = {"pest", "disease", "insect", "fungus", "blight", "worm",
-                   "spray", "pesticide", "fungicide", "treatment", "symptom",
-                   "crop damage", "infestation", "larvae", "virus", "wilt"}
-    has_pests   = any(kw in q for kw in pest_words)
-    if has_schemes and not has_pests:
-        return "schemes"
-    if has_pests and not has_schemes:
-        return "pests"
-    return "both"
-
-_TOOLS_BY_TYPE = {
-    "schemes": [_TOOLS[1]],
-    "pests":   [_TOOLS[0]],
-    "both":    _TOOLS,
-}
-
 # ── Query ──────────────────────────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
 async def query(request: QueryRequest):
-    q_type   = _classify_question(request.question)
-    tools    = _TOOLS_BY_TYPE[q_type]
-    print(f"[QUERY] classified={q_type!r}")
     messages: List[Dict] = [{"role": "user", "content": request.question}]
-    resp = _chat(messages, tools=tools)
+    resp = _chat(messages, tools=_TOOLS)
     msg  = resp["choices"][0]["message"]
 
     all_sources: List[Dict] = []
@@ -398,16 +350,16 @@ async def query(request: QueryRequest):
             args    = tc["function"]["arguments"]
             if isinstance(args, str):
                 args = json.loads(args)
-            top_k  = int(args.get("top_k", request.top_k))
-            q_text = args["query"]
+            top_k   = int(args.get("top_k", request.top_k))
+            q_text  = args["query"]
+            q_type  = args.get("type", "pests")   # model must pass 'pests' or 'schemes'
             if fn_name not in _TOOL_FN:
                 raise HTTPException(500, f"Unknown tool: {fn_name}")
-            print(f"[TOOL] {fn_name}(query={q_text!r}, top_k={top_k})")
-            chunks = _TOOL_FN[fn_name](q_text, top_k)
+            print(f"[TOOL] {fn_name}(type={q_type!r}, query={q_text!r}, top_k={top_k})")
+            chunks = _TOOL_FN[fn_name](q_text, q_type, top_k)
             all_sources.extend(chunks)
-            tools_used.append(fn_name)
+            tools_used.append(f"search_{q_type}")
 
-        # Build a clean synthesis prompt — avoids Ollama tool-format confusion
         if all_sources:
             context = "\n\n".join(f"[{c['filename']}]: {c['text']}" for c in all_sources)
             synthesis = [{"role": "user", "content": (
@@ -418,20 +370,30 @@ async def query(request: QueryRequest):
             msg  = resp["choices"][0]["message"]
 
     else:
-        # Fallback: model skipped tools — search directly using classification
+        # Fallback: model skipped tools — infer type from answer content keywords
         print("[QUERY] no tool calls — direct search fallback")
-        search_types = ("pests", "schemes") if q_type == "both" else (q_type,)
-        for doc_type in search_types:
+        q = request.question.lower()
+        schemes_kw = {"scheme", "yojana", "kisan", "subsidy", "pension", "insurance",
+                      "pmfby", "rkvy", "enam", "msp", "benefit", "loan", "bima"}
+        doc_types = ["schemes"] if any(k in q for k in schemes_kw) else ["pests"]
+        for doc_type in doc_types:
             chunks = _search(doc_type, request.question, request.top_k)
             if chunks:
                 all_sources.extend(chunks)
                 tools_used.append(f"search_{doc_type}")
+        if not all_sources:
+            # nothing found in guessed type — try the other
+            other = "pests" if doc_types[0] == "schemes" else "schemes"
+            chunks = _search(other, request.question, request.top_k)
+            all_sources.extend(chunks)
+            if chunks:
+                tools_used.append(f"search_{other}")
         if all_sources:
             context = "\n\n".join(f"[{c['filename']}]: {c['text']}" for c in all_sources)
-            messages = [{"role": "user", "content": (
+            synthesis = [{"role": "user", "content": (
                 f"Answer using only the context below.\n\nContext:\n{context}\n\nQuestion: {request.question}"
             )}]
-            resp = _chat(messages)
+            resp = _chat(synthesis)
             msg  = resp["choices"][0]["message"]
 
     return QueryResponse(
