@@ -1,16 +1,15 @@
 """
-AgriGPT RAG Service  v3.0
-Single Pinecone index, metadata-filtered retrieval, Gemini tool calling.
+AgriGPT RAG Service  v4.0
+Single Pinecone index, metadata-filtered retrieval, Ollama tool calling.
 """
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict
-import os, io, time
+import os, io, time, json
 
 from pinecone import Pinecone, ServerlessSpec
-import google.genai as genai
-from google.genai import types
+from openai import OpenAI
 from PyPDF2 import PdfReader
 import docx
 from dotenv import load_dotenv
@@ -21,33 +20,32 @@ load_dotenv()
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
+OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_API_KEY   = os.getenv("OLLAMA_API_KEY", "ollama")
+OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "gemma4:26b")
+RAG_BASE_URL     = os.getenv("RAG_BASE_URL", "http://localhost:8010")
 
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY not set")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not set")
 
-INDEX_NAME    = "agriculture-knowledge-base"
+INDEX_NAME    = os.getenv("PINECONE_INDEX_NAME", "agriculture-knowledge-base")
 ALLOWED_TYPES = {"pests", "schemes"}
 
 CHUNK_SIZE    = 1000
 CHUNK_OVERLAP = 200
-EMBED_DIM     = 768
-EMBED_MODEL   = "models/gemini-embedding-001"
-LLM_MODEL     = "gemini-2.5-flash"
+EMBED_DIM     = int(os.getenv("EMBED_DIM", "3072"))
 EMBED_BATCH   = 20
 UPSERT_BATCH  = 100
 
 # ── Clients ────────────────────────────────────────────────────────────────────
 
 pc     = Pinecone(api_key=PINECONE_API_KEY)
-gemini = genai.Client(api_key=GEMINI_API_KEY)
+client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
 
 app = FastAPI(
     title="AgriGPT RAG Service",
-    description="Single-index RAG with metadata filtering and Gemini tool calling",
-    version="3.0.0",
+    description="Single-index RAG with metadata filtering and Ollama tool calling",
+    version="4.0.0",
 )
 
 # ── Pinecone setup ─────────────────────────────────────────────────────────────
@@ -55,7 +53,7 @@ app = FastAPI(
 def _init_index():
     existing = {idx["name"] for idx in pc.list_indexes()}
     if INDEX_NAME not in existing:
-        print(f"Creating Pinecone index: {INDEX_NAME}")
+        print(f"Creating Pinecone index: {INDEX_NAME} (dim={EMBED_DIM})")
         pc.create_index(
             name=INDEX_NAME,
             dimension=EMBED_DIM,
@@ -119,21 +117,13 @@ def _chunk(text: str) -> List[str]:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _embed_batch(texts: List[str]) -> List[List[float]]:
-    res = gemini.models.embed_content(
-        model=EMBED_MODEL,
-        contents=texts,
-        config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
-    )
-    return [e.values for e in res.embeddings]
+    res = client.embeddings.create(model=OLLAMA_MODEL, input=texts)
+    return [e.embedding for e in res.data]
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _embed_query(text: str) -> List[float]:
-    res = gemini.models.embed_content(
-        model=EMBED_MODEL,
-        contents=text,
-        config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
-    )
-    return res.embeddings[0].values
+    res = client.embeddings.create(model=OLLAMA_MODEL, input=text)
+    return res.data[0].embedding
 
 # ── Pinecone search (metadata-filtered) ───────────────────────────────────────
 
@@ -156,56 +146,60 @@ def _search(doc_type: str, query: str, top_k: int) -> List[Dict]:
         for m in res["matches"]
     ]
 
-# ── Gemini tool definitions ────────────────────────────────────────────────────
+# ── Tool definitions (OpenAI format) ──────────────────────────────────────────
 
-_TOOLS = types.Tool(
-    function_declarations=[
-        types.FunctionDeclaration(
-            name="search_pests",
-            description=(
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_pests",
+            "description": (
                 "Search the pests and diseases knowledge base. Use this for questions about "
                 "crop diseases, pest identification, symptoms, treatments, prevention, and "
                 "agricultural pest management."
             ),
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "query": types.Schema(
-                        type=types.Type.STRING,
-                        description="Specific search query for pests or diseases",
-                    ),
-                    "top_k": types.Schema(
-                        type=types.Type.INTEGER,
-                        description="Number of results to retrieve (default 5)",
-                    ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Specific search query for pests or diseases",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of results to retrieve (default 5)",
+                    },
                 },
-                required=["query"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="search_schemes",
-            description=(
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_schemes",
+            "description": (
                 "Search the government schemes knowledge base. Use this for questions about "
                 "agricultural subsidies, government programs, farmer benefits, financial aid, "
                 "and agricultural policy schemes."
             ),
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "query": types.Schema(
-                        type=types.Type.STRING,
-                        description="Specific search query for government schemes",
-                    ),
-                    "top_k": types.Schema(
-                        type=types.Type.INTEGER,
-                        description="Number of results to retrieve (default 5)",
-                    ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Specific search query for government schemes",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of results to retrieve (default 5)",
+                    },
                 },
-                required=["query"],
-            ),
-        ),
-    ]
-)
+                "required": ["query"],
+            },
+        },
+    },
+]
 
 _TOOL_FN = {
     "search_pests":   lambda q, k: _search("pests", q, k),
@@ -267,40 +261,35 @@ async def upload(
         chunks_added=len(chunks),
     )
 
-# ── Gemini generate (with retry) ──────────────────────────────────────────────
-
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(min=2, max=15))
-def _generate(contents, cfg):
-    return gemini.models.generate_content(model=LLM_MODEL, contents=contents, config=cfg)
-
 # ── Query endpoint ─────────────────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
 async def query(request: QueryRequest):
     """
-    Ask a question. Gemini picks the right tool (`search_pests` or `search_schemes`),
+    Ask a question. The model picks the right tool (`search_pests` or `search_schemes`),
     queries the single index with a metadata filter, and returns a grounded answer.
     """
-    history = [
-        types.Content(role="user", parts=[types.Part(text=request.question)])
-    ]
-    cfg = types.GenerateContentConfig(tools=[_TOOLS])
+    messages = [{"role": "user", "content": request.question}]
 
-    # Round 1 — Gemini decides which tool(s) to call
-    resp = _generate(history, cfg)
+    resp = client.chat.completions.create(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        tools=_TOOLS,
+    )
 
     all_sources: List[Dict] = []
     tools_used:  List[str]  = []
 
-    if resp.function_calls:
-        history.append(resp.candidates[0].content)
-        fn_response_parts = []
+    msg = resp.choices[0].message
 
-        for fc in resp.function_calls:
-            args    = dict(fc.args)
+    if msg.tool_calls:
+        messages.append(msg)
+
+        for tc in msg.tool_calls:
+            fn_name = tc.function.name
+            args    = json.loads(tc.function.arguments)
             top_k   = int(args.get("top_k", request.top_k))
             q_text  = args["query"]
-            fn_name = fc.name
 
             if fn_name not in _TOOL_FN:
                 raise HTTPException(500, f"Unknown tool requested by model: {fn_name}")
@@ -310,27 +299,28 @@ async def query(request: QueryRequest):
             all_sources.extend(chunks)
             tools_used.append(fn_name)
 
-            fn_response_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name=fn_name,
-                        response={
-                            "chunks": [
-                                {"text": c["text"], "source": c["filename"]}
-                                for c in chunks
-                            ]
-                        },
-                    )
-                )
-            )
-
-        history.append(types.Content(role="function", parts=fn_response_parts))
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps({
+                    "chunks": [
+                        {"text": c["text"], "source": c["filename"]}
+                        for c in chunks
+                    ]
+                }),
+            })
 
         # Round 2 — generate final grounded answer
-        resp = _generate(history, cfg)
+        resp = client.chat.completions.create(
+            model=OLLAMA_MODEL,
+            messages=messages,
+            tools=_TOOLS,
+        )
+
+    answer = resp.choices[0].message.content or "No answer could be generated."
 
     return QueryResponse(
-        answer=resp.text or "No answer could be generated.",
+        answer=answer,
         sources=[SourceChunk(**s) for s in all_sources],
         tools_used=tools_used,
     )
@@ -342,9 +332,10 @@ def health():
     try:
         stats = index.describe_index_stats()
         return {
-            "status":       "healthy",
-            "index":        INDEX_NAME,
+            "status":        "healthy",
+            "index":         INDEX_NAME,
             "total_vectors": stats.total_vector_count,
+            "model":         OLLAMA_MODEL,
         }
     except Exception as e:
         return {"status": "error", "detail": str(e)}
@@ -354,9 +345,9 @@ def health():
 def stats():
     s = index.describe_index_stats()
     return {
-        "index_name":    INDEX_NAME,
-        "total_vectors": s.total_vector_count,
-        "dimension":     s.dimension,
+        "index_name":     INDEX_NAME,
+        "total_vectors":  s.total_vector_count,
+        "dimension":      s.dimension,
         "index_fullness": s.index_fullness,
     }
 
@@ -365,11 +356,12 @@ def stats():
 def root():
     return {
         "service": "AgriGPT RAG Service",
-        "version": "3.0.0",
+        "version": "4.0.0",
+        "model":   OLLAMA_MODEL,
         "docs":    "/docs",
         "endpoints": {
             "POST /upload": "Index a document — pass file + type ('pests' or 'schemes')",
-            "POST /query":  "Ask a question — Gemini picks the right tool automatically",
+            "POST /query":  "Ask a question — model picks the right tool automatically",
             "GET  /health": "Health check with total vector count",
             "GET  /stats":  "Index statistics",
         },
