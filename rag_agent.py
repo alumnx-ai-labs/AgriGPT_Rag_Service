@@ -117,27 +117,41 @@ def _chunk(text: str) -> List[str]:
 
 # ── Ollama helpers (direct httpx calls) ───────────────────────────────────────
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-def _embed_batch(texts: List[str]) -> List[List[float]]:
+def _raw_embed(text: str) -> List[float]:
+    """Try /api/embed (new), fall back to /api/embeddings (old)."""
     with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
-        r = http.post(
-            f"{OLLAMA_BASE_URL}/api/embed",
-            json={"model": OLLAMA_MODEL, "input": texts},
-            headers=_AUTH_HEADERS,
-        )
-        r.raise_for_status()
-        return r.json()["embeddings"]
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-def _embed_query(text: str) -> List[float]:
-    with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
+        # Try newer endpoint first
         r = http.post(
             f"{OLLAMA_BASE_URL}/api/embed",
             json={"model": OLLAMA_MODEL, "input": text},
             headers=_AUTH_HEADERS,
         )
+        if r.status_code == 200:
+            return r.json()["embeddings"][0]
+
+        print(f"[EMBED] /api/embed failed ({r.status_code}): {r.text[:200]}")
+
+        # Fall back to older endpoint
+        r = http.post(
+            f"{OLLAMA_BASE_URL}/api/embeddings",
+            json={"model": OLLAMA_MODEL, "prompt": text},
+            headers=_AUTH_HEADERS,
+        )
+        if r.status_code == 200:
+            return r.json()["embedding"]
+
+        print(f"[EMBED] /api/embeddings failed ({r.status_code}): {r.text[:200]}")
         r.raise_for_status()
-        return r.json()["embeddings"][0]
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+def _embed_batch(texts: List[str]) -> List[List[float]]:
+    return [_raw_embed(t) for t in texts]
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+def _embed_query(text: str) -> List[float]:
+    return _raw_embed(text)
 
 def _parse_ndjson(text: str) -> Dict:
     """
