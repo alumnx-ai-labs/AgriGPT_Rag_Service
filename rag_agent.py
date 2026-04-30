@@ -361,7 +361,6 @@ async def query(request: QueryRequest):
     print(f"[QUERY] tool_calls={bool(tool_calls)}  content={str(msg.get('content',''))[:80]!r}")
 
     if tool_calls:
-        messages.append(msg)
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
             args    = tc["function"]["arguments"]
@@ -375,15 +374,16 @@ async def query(request: QueryRequest):
             chunks = _TOOL_FN[fn_name](q_text, top_k)
             all_sources.extend(chunks)
             tools_used.append(fn_name)
-            messages.append({
-                "role":         "tool",
-                "tool_call_id": tc["id"],
-                "content":      json.dumps({
-                    "chunks": [{"text": c["text"], "source": c["filename"]} for c in chunks]
-                }),
-            })
-        resp = _chat(messages)
-        msg  = resp["choices"][0]["message"]
+
+        # Build a clean synthesis prompt — avoids Ollama tool-format confusion
+        if all_sources:
+            context = "\n\n".join(f"[{c['filename']}]: {c['text']}" for c in all_sources)
+            synthesis = [{"role": "user", "content": (
+                f"Answer the question using only the context below.\n\n"
+                f"Context:\n{context}\n\nQuestion: {request.question}"
+            )}]
+            resp = _chat(synthesis)
+            msg  = resp["choices"][0]["message"]
 
     else:
         # Fallback: model skipped tools — search directly
