@@ -36,7 +36,6 @@ _parsed    = urlparse(OLLAMA_BASE_URL)
 OLLAMA_HOST = f"{_parsed.scheme}://{_parsed.netloc}"   # e.g. http://3.109.63.164
 
 INDEX_NAME    = os.getenv("PINECONE_INDEX_NAME", "agriculture-knowledge-base")
-ALLOWED_TYPES = {"pests", "schemes"}
 
 CHUNK_SIZE     = 1000
 CHUNK_OVERLAP  = 200
@@ -292,8 +291,6 @@ async def upload(
     file: UploadFile = File(...),
     type: str = Form(...),
 ):
-    if type not in ALLOWED_TYPES:
-        raise HTTPException(400, f"type must be one of: {', '.join(sorted(ALLOWED_TYPES))}")
     text = _extract_text(file)
     if not text.strip():
         raise HTTPException(400, "File is empty or unreadable")
