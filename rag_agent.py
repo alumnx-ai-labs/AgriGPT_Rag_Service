@@ -151,7 +151,7 @@ def _load_known_types():
 def _save_known_types():
     index.upsert(vectors=[{
         "id":     _REGISTRY_ID,
-        "values": [0.0] * EMBED_DIM,
+        "values": [1e-7] * EMBED_DIM,
         "metadata": {"types": list(_known_types), "is_registry": True},
     }])
 
