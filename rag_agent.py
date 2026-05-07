@@ -132,7 +132,8 @@ def _init_index(dim: int):
 
 EMBED_DIM    = _detect_dim()
 index        = _init_index(EMBED_DIM)
-_known_types: set = set()
+_known_types: set  = set()
+_known_files: dict = {}   # {filename: type}
 _REGISTRY_ID = "__types_registry__"
 
 
@@ -141,18 +142,23 @@ def _load_known_types():
         result = index.fetch(ids=[_REGISTRY_ID])
         vectors = result.get("vectors") or {}
         if _REGISTRY_ID in vectors:
-            types = vectors[_REGISTRY_ID].get("metadata", {}).get("types", [])
-            _known_types.update(types)
-            print(f"[REGISTRY] loaded types: {_known_types}")
+            meta  = vectors[_REGISTRY_ID].get("metadata", {})
+            _known_types.update(meta.get("types", []))
+            _known_files.update(meta.get("files", {}))
+            print(f"[REGISTRY] types={_known_types}  files={list(_known_files.keys())}")
     except Exception as e:
-        print(f"[REGISTRY] could not load types: {e}")
+        print(f"[REGISTRY] could not load: {e}")
 
 
 def _save_known_types():
     index.upsert(vectors=[{
         "id":     _REGISTRY_ID,
         "values": [1e-7] * EMBED_DIM,
-        "metadata": {"types": list(_known_types), "is_registry": True},
+        "metadata": {
+            "types":       list(_known_types),
+            "files":       _known_files,
+            "is_registry": True,
+        },
     }])
 
 
@@ -353,6 +359,7 @@ async def upload(
         index.upsert(vectors=vectors[i : i + UPSERT_BATCH])
 
     _known_types.add(type)
+    _known_files[file.filename] = type
     _save_known_types()
 
     return UploadResponse(
@@ -442,6 +449,12 @@ async def delete_document(filename: str):
     for i in range(0, len(ids_to_delete), 1000):
         index.delete(ids=ids_to_delete[i : i + 1000])
 
+    # Remove from registry
+    removed_type = _known_files.pop(filename, None)
+    if removed_type and not any(v == removed_type for v in _known_files.values()):
+        _known_types.discard(removed_type)
+    _save_known_types()
+
     print(f"[DELETE] {filename}: {len(ids_to_delete)} chunks deleted")
     return DeleteResponse(
         message="Deleted successfully",
@@ -452,8 +465,10 @@ async def delete_document(filename: str):
 
 @app.get("/documents", tags=["Upload"])
 def list_documents():
-    """List all indexed document types."""
-    return {"types": sorted(_known_types)}
+    grouped: dict = {}
+    for filename, doc_type in _known_files.items():
+        grouped.setdefault(doc_type, []).append(filename)
+    return {"documents": grouped}
 
 
 # ── System endpoints ───────────────────────────────────────────────────────────
